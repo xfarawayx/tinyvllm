@@ -407,9 +407,11 @@ torch::Tensor QwenModel::forward_prefill(
 torch::Tensor QwenModel::forward_decode(const torch::Tensor& input_ids,
                                         const torch::Tensor& positions,
                                         const std::vector<int64_t>& seq_ids,
-                                        PagedKVCache& cache) {
+                                        PagedKVCache& cache,
+                                        const torch::Tensor& positions_cpu) {
   auto input = input_ids.to(device_).to(torch::kLong);
-  auto pos = positions.to(device_).to(torch::kLong);
+  auto pos = positions.is_cuda() ? positions.to(torch::kLong)
+                                 : positions.to(device_).to(torch::kLong);
 
   int64_t bsz = input.size(0);
   int64_t seq_len = input.size(1);
@@ -430,8 +432,14 @@ torch::Tensor QwenModel::forward_decode(const torch::Tensor& input_ids,
 
   torch::Tensor block_tables, context_lens;
 
-  // Convert start_positions to CPU once (avoid 28x GPU->CPU sync in append_batch).
-  auto start_pos_cpu = pos.squeeze(1).to(torch::kCPU);
+  // Use caller-provided CPU positions to avoid GPU->CPU sync.
+  auto start_pos_cpu = positions_cpu.defined()
+      ? positions_cpu.to(torch::kLong).contiguous()
+      : pos.squeeze(1).to(torch::kCPU);
+
+  // Pre-compute slot_mapping once: allocates blocks, updates cur_len, builds
+  // CUDA int32 [B] mapping. Reused across all 28 layers (same slots).
+  auto slot_mapping = cache.prepare_decode_slots(seq_ids, start_pos_cpu);
 
   for (int64_t i = 0; i < config_.num_hidden_layers; ++i) {
     auto& layer = layers_[i];
@@ -465,7 +473,7 @@ torch::Tensor QwenModel::forward_decode(const torch::Tensor& input_ids,
 
     cuda::apply_rope(q, k, pos, rope_cos_, rope_sin_);
 
-    cache.append_batch(i, seq_ids, k, v, start_pos_cpu);
+    cache.append_batch(i, k, v, slot_mapping);
 
     if (i == 0) {
       block_tables = cache.block_tables_cpu_tensor(seq_ids);

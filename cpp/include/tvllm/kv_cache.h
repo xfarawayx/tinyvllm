@@ -67,13 +67,16 @@ class PagedKVCache {
               const torch::Tensor& k, const torch::Tensor& v,
               int64_t start_pos);
 
-  /// Decode batch variant backed by the fused scatter_kv_decode CUDA kernel.
-  ///   k, v : [batch_size, num_tokens, num_kv_heads, head_dim]
-  ///   start_positions : [batch_size]
+  /// Pre-compute slot_mapping for a decode batch (one token per sequence).
+  /// Returns a CUDA int32 tensor [batch_size] of flat slot indices.
+  /// Also allocates any needed blocks and updates cur_len.
+  torch::Tensor prepare_decode_slots(const std::vector<int64_t>& seq_ids,
+                                     const torch::Tensor& start_positions_cpu);
+
+  /// Fast append using a pre-computed slot_mapping (skips per-layer rebuild).
   void append_batch(int64_t layer,
-                    const std::vector<int64_t>& seq_ids,
                     const torch::Tensor& k, const torch::Tensor& v,
-                    const torch::Tensor& start_positions);
+                    const torch::Tensor& slot_mapping);
 
   // ---- Metadata for kernel dispatch ----------------------------------------
 

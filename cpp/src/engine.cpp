@@ -58,13 +58,13 @@ static torch::Dtype resolve_dtype() {
 static int64_t resolve_block_size() {
   const char* env = std::getenv("TVLLM_BLOCK_SIZE");
   if (!env) {
-    return 16;
+    return 32;
   }
   try {
     int64_t value = std::stoll(env);
-    return value > 0 ? value : 16;
+    return value > 0 ? value : 32;
   } catch (...) {
-    return 16;
+    return 32;
   }
 }
 
@@ -404,9 +404,12 @@ std::vector<std::vector<int64_t>> Engine::generate(
         int64_t bsz = static_cast<int64_t>(active.size());
         auto input_ids = torch::tensor(tokens, options).view({bsz, 1});
         auto pos_tensor = torch::tensor(positions, options).view({bsz, 1});
+        // Keep a CPU copy to avoid GPU->CPU sync inside forward_decode.
+        auto pos_cpu = torch::tensor(positions,
+            torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU)).view({bsz, 1});
 
         auto logits_batch = model_->forward_decode(
-            input_ids, pos_tensor, cache_ids, cache);
+            input_ids, pos_tensor, cache_ids, cache, pos_cpu);
 
         std::vector<SampleParams> step_sample_params;
         step_sample_params.reserve(active.size());

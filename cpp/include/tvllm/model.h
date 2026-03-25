@@ -66,7 +66,8 @@ class QwenModel {
   torch::Tensor forward_decode(const torch::Tensor& input_ids,
                                const torch::Tensor& positions,
                                const std::vector<int64_t>& seq_ids,
-                               PagedKVCache& cache);
+                               PagedKVCache& cache,
+                               const torch::Tensor& positions_cpu = {});
 
   const ModelConfig& config() const { return config_; }
 

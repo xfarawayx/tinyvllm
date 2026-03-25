@@ -238,57 +238,20 @@ void PagedKVCache::append(int64_t seq_id, int64_t layer,
   seq.cur_len = std::max(seq.cur_len, start_pos + num_tokens);
 }
 
-void PagedKVCache::append_batch(int64_t layer,
-                                const std::vector<int64_t>& seq_ids,
-                                const torch::Tensor& k,
-                                const torch::Tensor& v,
-                                const torch::Tensor& start_positions) {
-  if (k.dim() != 4 || v.dim() != 4) {
-    throw std::runtime_error("append_batch expects k/v shape [B, T, Hkv, D]");
-  }
-  if (!k.sizes().equals(v.sizes())) {
-    throw std::runtime_error("k and v shape mismatch in append_batch");
-  }
-  if (start_positions.dim() != 1) {
-    throw std::runtime_error("start_positions must be 1-D [B]");
-  }
-
-  const int64_t bsz = k.size(0);
-  const int64_t num_tokens = k.size(1);
-  if (bsz != static_cast<int64_t>(seq_ids.size()) ||
-      bsz != start_positions.size(0)) {
-    throw std::runtime_error("batch size mismatch in append_batch");
-  }
-  if (!device_.is_cuda()) {
-    throw std::runtime_error("append_batch requires a CUDA KV cache");
-  }
-  if (!k.is_cuda() || !v.is_cuda()) {
-    throw std::runtime_error("append_batch expects CUDA K/V tensors");
-  }
-  if (num_tokens != 1) {
-    throw std::runtime_error("append_batch only supports decode batches with num_tokens == 1");
-  }
-  if (k.scalar_type() != v.scalar_type()) {
-    throw std::runtime_error("append_batch requires matching K/V dtypes");
-  }
-
-  // Accept CPU tensor directly if caller already converted (avoids per-layer sync).
-  auto start_cpu = start_positions.is_cpu()
-      ? start_positions
-      : start_positions.to(torch::kCPU);
-
-  if (layer < 0 || layer >= config_.num_hidden_layers) {
-    throw std::runtime_error("invalid layer index: " + std::to_string(layer));
-  }
+torch::Tensor PagedKVCache::prepare_decode_slots(
+    const std::vector<int64_t>& seq_ids,
+    const torch::Tensor& start_positions_cpu) {
+  const int64_t bsz = static_cast<int64_t>(seq_ids.size());
+  auto start_acc = start_positions_cpu.accessor<int64_t, 2>();
 
   std::vector<int32_t> slot_mapping_vec;
   slot_mapping_vec.reserve(bsz);
 
   for (int64_t b = 0; b < bsz; ++b) {
     const int64_t seq_id = seq_ids[b];
-    const int64_t pos = start_cpu[b].item<int64_t>();
+    const int64_t pos = start_acc[b][0];
     if (pos < 0 || pos + 1 > config_.max_position_embeddings) {
-      throw std::runtime_error("position overflow in append_batch (start_pos=" +
+      throw std::runtime_error("position overflow in prepare_decode_slots (start_pos=" +
           std::to_string(pos) + ")");
     }
 
@@ -300,10 +263,18 @@ void PagedKVCache::append_batch(int64_t layer,
     seq.cur_len = std::max(seq.cur_len, pos + 1);
   }
 
-  auto slot_mapping = torch::tensor(
+  return torch::tensor(
       slot_mapping_vec,
       torch::TensorOptions().dtype(torch::kInt32).device(device_));
+}
 
+void PagedKVCache::append_batch(int64_t layer,
+                                const torch::Tensor& k,
+                                const torch::Tensor& v,
+                                const torch::Tensor& slot_mapping) {
+  if (layer < 0 || layer >= config_.num_hidden_layers) {
+    throw std::runtime_error("invalid layer index: " + std::to_string(layer));
+  }
   auto& k_blk = block_manager_.k_blocks(layer);
   auto& v_blk = block_manager_.v_blocks(layer);
   cuda::scatter_kv_decode(k_blk, v_blk, k, v, slot_mapping);
