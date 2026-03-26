@@ -171,71 +171,63 @@ int32_t PagedKVCache::allocate_blocks_up_to(int64_t seq_id, int64_t pos) {
 //  KV write
 // ===========================================================================
 
-void PagedKVCache::append(int64_t seq_id, int64_t layer,
-                          const torch::Tensor& k, const torch::Tensor& v,
-                          int64_t start_pos) {
-  auto& seq = get_seq(seq_id);
-  if (layer < 0 || layer >= config_.num_hidden_layers) {
-    throw std::runtime_error("invalid layer index: " + std::to_string(layer));
-  }
+torch::Tensor PagedKVCache::prepare_prefill_slots(
+    const std::vector<int64_t>& seq_ids,
+    const std::vector<int64_t>& start_positions,
+    const std::vector<int64_t>& seq_lens) {
+  const int64_t nseq = static_cast<int64_t>(seq_ids.size());
+  const bool prefix_caching = block_manager_.prefix_caching_enabled();
 
-  // Normalise shape to [num_tokens, num_kv_heads, head_dim].
-  auto k_in = k.dim() == 2 ? k.unsqueeze(0) : k;
-  auto v_in = v.dim() == 2 ? v.unsqueeze(0) : v;
-  if (k_in.dim() != 3 || v_in.dim() != 3) {
-    throw std::runtime_error("append expects k/v shape [num_tokens, num_kv_heads, head_dim]");
-  }
-  if (!k_in.sizes().equals(v_in.sizes())) {
-    throw std::runtime_error("k and v shape mismatch in append");
-  }
+  int64_t total_tokens = 0;
+  for (auto len : seq_lens) total_tokens += len;
 
-  const int64_t num_tokens = k_in.size(0);
-  if (start_pos < 0 || start_pos + num_tokens > config_.max_position_embeddings) {
-    throw std::runtime_error("position overflow in append (start_pos=" +
-        std::to_string(start_pos) + ", num_tokens=" + std::to_string(num_tokens) + ")");
-  }
+  std::vector<int32_t> slot_vec;
+  slot_vec.reserve(total_tokens);
 
-  auto& k_blk = block_manager_.k_blocks(layer);
-  auto& v_blk = block_manager_.v_blocks(layer);
+  for (int64_t i = 0; i < nseq; ++i) {
+    auto& seq = get_seq(seq_ids[i]);
+    const int64_t start_pos = start_positions[i];
+    const int64_t num_tokens = seq_lens[i];
 
-  // ---- Block-aligned batch copy ------------------------------------------
-  // Group contiguous tokens that land in the same physical block and copy
-  // them in one narrow().copy_() call.  This reduces the number of CUDA
-  // kernel launches from 2*T to 2*ceil(T / block_size).
-  int64_t idx = 0;
-  while (idx < num_tokens) {
-    const int64_t pos      = start_pos + idx;
-    const int32_t block_id = allocate_blocks_up_to(seq_id, pos);
-    const int64_t slot     = pos % block_size_;
-    const int64_t chunk    = std::min(block_size_ - slot, num_tokens - idx);
-    const int64_t logical_block = pos / block_size_;
+    if (num_tokens <= 0) continue;
 
-    // Skip writing to blocks that are shared (refcount > 1) — KV data
-    // is already there from a previous sequence.
-    bool skip_write = block_manager_.prefix_caching_enabled() &&
-                      block_manager_.block_meta(block_id).refcount > 1 &&
-                      block_manager_.block_meta(block_id).is_full;
+    // Pre-allocate all blocks this sequence needs in one go.
+    allocate_blocks_up_to(seq_ids[i], start_pos + num_tokens - 1);
 
-    if (!skip_write) {
-      k_blk.select(0, block_id).narrow(0, slot, chunk)
-           .copy_(k_in.narrow(0, idx, chunk));
-      v_blk.select(0, block_id).narrow(0, slot, chunk)
-           .copy_(v_in.narrow(0, idx, chunk));
+    for (int64_t j = 0; j < num_tokens; ++j) {
+      const int64_t pos = start_pos + j;
+      const int64_t logical_block = pos / block_size_;
+      const int64_t slot_in_block = pos % block_size_;
+      const int32_t block_id = seq.block_table[logical_block];
+
+      // Skip writing to shared blocks (KV data already present).
+      if (prefix_caching) {
+        const auto& meta = block_manager_.block_meta(block_id);
+        if (meta.refcount > 1 && meta.is_full) {
+          slot_vec.push_back(-1);
+          continue;
+        }
+      }
+
+      slot_vec.push_back(
+          static_cast<int32_t>(block_id * block_size_ + slot_in_block));
+
+      // Register block hash when this token completes a block.
+      if (prefix_caching &&
+          slot_in_block == block_size_ - 1 &&
+          logical_block < static_cast<int64_t>(seq.block_hashes.size()) &&
+          seq.block_hashes[logical_block] != 0 &&
+          !block_manager_.block_meta(block_id).is_full) {
+        block_manager_.mark_block_full(block_id, seq.block_hashes[logical_block]);
+      }
     }
 
-    // Register block hash when block becomes full.
-    if (block_manager_.prefix_caching_enabled() &&
-        slot + chunk == block_size_ &&
-        logical_block < static_cast<int64_t>(seq.block_hashes.size()) &&
-        seq.block_hashes[logical_block] != 0 &&
-        !block_manager_.block_meta(block_id).is_full) {
-      block_manager_.mark_block_full(block_id, seq.block_hashes[logical_block]);
-    }
-
-    idx += chunk;
+    seq.cur_len = std::max(seq.cur_len, start_pos + num_tokens);
   }
 
-  seq.cur_len = std::max(seq.cur_len, start_pos + num_tokens);
+  return torch::tensor(
+      slot_vec,
+      torch::TensorOptions().dtype(torch::kInt32).device(device_));
 }
 
 torch::Tensor PagedKVCache::prepare_decode_slots(
@@ -277,7 +269,7 @@ void PagedKVCache::append_batch(int64_t layer,
   }
   auto& k_blk = block_manager_.k_blocks(layer);
   auto& v_blk = block_manager_.v_blocks(layer);
-  cuda::scatter_kv_decode(k_blk, v_blk, k, v, slot_mapping);
+  cuda::scatter_kv(k_blk, v_blk, k, v, slot_mapping);
 }
 
 // ===========================================================================

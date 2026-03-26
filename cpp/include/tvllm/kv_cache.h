@@ -60,12 +60,14 @@ class PagedKVCache {
 
   // ---- KV write ------------------------------------------------------------
 
-  /// Append K/V for a single sequence at one layer.
-  ///   k, v : [num_tokens, num_kv_heads, head_dim]
-  /// Copies are batched per-block to minimize kernel launches.
-  void append(int64_t seq_id, int64_t layer,
-              const torch::Tensor& k, const torch::Tensor& v,
-              int64_t start_pos);
+  /// Pre-compute slot_mapping for a prefill batch (multiple tokens per sequence).
+  /// Returns a CUDA int32 tensor [total_tokens] of flat slot indices.
+  /// Slots for prefix-cached blocks are set to -1 (kernel will skip them).
+  /// Also allocates needed blocks, registers block hashes, and updates cur_len.
+  torch::Tensor prepare_prefill_slots(
+      const std::vector<int64_t>& seq_ids,
+      const std::vector<int64_t>& start_positions,
+      const std::vector<int64_t>& seq_lens);
 
   /// Pre-compute slot_mapping for a decode batch (one token per sequence).
   /// Returns a CUDA int32 tensor [batch_size] of flat slot indices.
@@ -73,7 +75,10 @@ class PagedKVCache {
   torch::Tensor prepare_decode_slots(const std::vector<int64_t>& seq_ids,
                                      const torch::Tensor& start_positions_cpu);
 
-  /// Fast append using a pre-computed slot_mapping (skips per-layer rebuild).
+  /// Scatter K/V into paged cache using a pre-computed slot_mapping.
+  /// Accepts any k/v rank whose last two dims are [num_kv_heads, head_dim]
+  /// (e.g. [N, Hkv, D] for prefill, [B, 1, Hkv, D] for decode).
+  /// slot_mapping entries of -1 are skipped (prefix-cached blocks).
   void append_batch(int64_t layer,
                     const torch::Tensor& k, const torch::Tensor& v,
                     const torch::Tensor& slot_mapping);

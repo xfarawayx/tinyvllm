@@ -74,25 +74,27 @@ void apply_rope(torch::Tensor& q,
 //
 torch::Tensor silu_mul(const torch::Tensor& gate_up);
 
-// ---------- Fused KV scatter for decode ------------------------------------
+// ---------- Fused KV scatter -----------------------------------------------
 //
-// Scatters K and V tokens from a decode batch into paged KV cache blocks
-// using a precomputed slot_mapping.  Replaces per-sequence copy_() calls
-// with a single kernel launch per layer.
+// Scatters K and V tokens into paged KV cache blocks using a precomputed
+// slot_mapping.  Accepts any input rank whose last two dims are [Hkv, D]
+// (e.g. [N, Hkv, D] for prefill or [B, 1, Hkv, D] for decode).
+// A -1 sentinel in slot_mapping causes the corresponding token to be skipped
+// (used for prefix-cached blocks).
 //
 // Parameters
 // ----------
 // k_pool      : [num_blocks, block_size, num_kv_heads, head_dim]  – destination (modified)
 // v_pool      : [num_blocks, block_size, num_kv_heads, head_dim]  – destination (modified)
-// k           : [B, 1, num_kv_heads, head_dim]  (fp16/bf16)  – source
-// v           : [B, 1, num_kv_heads, head_dim]  (fp16/bf16)  – source
-// slot_mapping: [B]  (int32)  – flat slot index per sequence
+// k           : [*, num_kv_heads, head_dim]  (fp16/bf16)  – source
+// v           : [*, num_kv_heads, head_dim]  (fp16/bf16)  – source
+// slot_mapping: [N]  (int32)  – flat slot index per token (-1 = skip)
 //
-void scatter_kv_decode(torch::Tensor& k_pool,
-                       torch::Tensor& v_pool,
-                       const torch::Tensor& k,
-                       const torch::Tensor& v,
-                       const torch::Tensor& slot_mapping);
+void scatter_kv(torch::Tensor& k_pool,
+                torch::Tensor& v_pool,
+                const torch::Tensor& k,
+                const torch::Tensor& v,
+                const torch::Tensor& slot_mapping);
 
 // ---------- NF4 Dequantization -----------------------------------------------
 //

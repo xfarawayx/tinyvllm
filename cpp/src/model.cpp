@@ -281,19 +281,23 @@ torch::Tensor QwenModel::forward_prefill(
   // Detect if any sequence has a cached prefix (start_pos > 0).
   bool has_prefix_cache = false;
   for (int64_t i = 0; !has_prefix_cache && i < nseq; ++i) {
-    if (start_pos[i] > 0) has_prefix_cache = true; 
+    if (start_pos[i] > 0) has_prefix_cache = true;
   }
+
+  // Pre-compute slot_mapping for all prefill tokens before the layer loop.
+  // This allocates blocks, registers hashes, and updates cur_len once,
+  // replacing per-sequence per-layer append() calls with a single fused
+  // scatter kernel per layer.
+  auto prefill_slot_mapping = cache.prepare_prefill_slots(
+      seq_ids, start_pos, seq_lens);
 
   // If using paged prefill, plan once before the layer loop.
   // We need block_tables and context_lens from the cache.
   torch::Tensor block_tables_t, context_lens_t;
   if (has_prefix_cache) {
+    // Fetch block_tables after prepare_prefill_slots so newly allocated
+    // blocks are included.
     block_tables_t = cache.block_tables_cpu_tensor(seq_ids);
-    // context_lens = start_pos[i] + seq_lens[i] for each sequence
-    // (total KV length: cached prefix + new tokens to be appended).
-    // But at this point, only start_pos[i] tokens are in the cache.
-    // After appending new K/V per layer, the total will be start_pos[i] + seq_lens[i].
-    // We pass the final total KV length for attention.
     std::vector<int32_t> ctx_lens(nseq);
     for (int64_t i = 0; i < nseq; ++i) {
       ctx_lens[i] = static_cast<int32_t>(start_pos[i] + seq_lens[i]);
@@ -338,23 +342,14 @@ torch::Tensor QwenModel::forward_prefill(
 
     cuda::apply_rope(q, k, positions, rope_cos_, rope_sin_);
 
-    // Append new K/V to cache (skip-write for shared blocks is handled inside).
-    int64_t offset = 0;
-    for (int64_t i = 0; i < nseq; ++i) {
-      auto k_seq = k.narrow(0, offset, seq_lens[i]);
-      auto v_seq = v.narrow(0, offset, seq_lens[i]);
-      cache.append(seq_ids[i], li, k_seq, v_seq, start_pos[i]);
-      offset += seq_lens[i];
-    }
+    // Scatter K/V into paged cache via fused kernel (1 launch per layer).
+    cache.append_batch(li, k, v, prefill_slot_mapping);
 
     torch::Tensor context;
     if (has_prefix_cache) {
       // Paged prefill: new tokens attend to full KV (cached + new) via page table.
       if (li == 0) {
         // Plan once, reuse across all layers.
-        // Re-fetch block_tables after first layer's append to include newly
-        // allocated blocks for the new tokens.
-        block_tables_t = cache.block_tables_cpu_tensor(seq_ids);
         cuda::flash_attn_prefill_paged_plan(
             q, cache.k_pool(li), cu_seqlens,
             block_tables_t, context_lens_t,
