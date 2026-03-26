@@ -33,37 +33,37 @@ def main() -> None:
     parser.add_argument("--max_batch_size", type=int, default=0,
                         help="Cap concurrent running requests; 0 lets the engine decide")
     parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--ignore_eos", action="store_true",
-                        help="Ignore EOS and continue until max_new_tokens")
+    parser.add_argument("--top_p", type=float, default=1.0,
+                        help="Top-p (nucleus) sampling threshold (1.0 = disabled)")
+    parser.add_argument("--top_k", type=int, default=-1,
+                        help="Top-k sampling threshold (-1 = disabled)")
+    parser.add_argument("--ignore_eos", action="store_true", default=True,
+                        help="Ignore EOS and continue until max_new_tokens (default: True)")
+    parser.add_argument("--no_ignore_eos", action="store_false", dest="ignore_eos",
+                        help="Stop at EOS (makes output token count non-deterministic)")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     random.seed(args.seed)
 
-    # --- Read vocab_size from config.txt ---
-    vocab_size = None
-    config_path = f"{args.model_dir}/config.txt"
-    with open(config_path) as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("vocab_size"):
-                vocab_size = int(line.split("=", 1)[1].strip())
-                break
-    if vocab_size is None:
-        print("[ERROR] Could not read vocab_size from config.txt", file=sys.stderr)
-        sys.exit(1)
-
     # --- Generate random input sequences ---
-    input_lens = [random.randint(args.input_len_min, args.input_len_max)
-                  for _ in range(args.num_requests)]
-
-    # Use token ids in [1, vocab_size-1] to avoid special tokens (0 is often pad).
+    # Match bench.py (nanovllm) generation pattern exactly: interleave
+    # length sampling and token sampling so that the same seed produces the
+    # same sequences.  Token range [0, 10000] also matches bench.py.
     batch_input_ids = [
-        [random.randint(1, vocab_size - 1) for _ in range(length)]
-        for length in input_lens
+        [random.randint(0, 10000)
+         for _ in range(random.randint(args.input_len_min, args.input_len_max))]
+        for _ in range(args.num_requests)
     ]
 
+    # Output lengths generated right after input ids — same random stream
+    # order as bench.py so that identical seed produces identical workload.
+    output_lens = [random.randint(args.output_len_min, args.output_len_max)
+                   for _ in range(args.num_requests)]
+
+    input_lens = [len(ids) for ids in batch_input_ids]
     total_input_tokens = sum(input_lens)
+    requested_output_tokens = sum(output_lens)
 
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
     gpu_index = os.environ.get("CUDA_VISIBLE_DEVICES", "all")
@@ -106,8 +106,6 @@ def main() -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    output_lens = [random.randint(args.output_len_min, args.output_len_max)
-                   for _ in range(args.num_requests)]
     sample_params = [
         tinyvllm.SampleParams(
             ol,
@@ -129,7 +127,6 @@ def main() -> None:
     # --- Compute statistics ---
     actual_output_lens = [len(out) - input_lens[i]
                           for i, out in enumerate(all_outputs)]
-    requested_output_tokens = sum(output_lens)
     total_output_tokens = sum(actual_output_lens)
     total_tokens = total_input_tokens + total_output_tokens
 
