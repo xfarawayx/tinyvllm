@@ -33,14 +33,6 @@ inline float default_scale(int64_t head_dim, float softmax_scale) {
         : 1.0f / std::sqrt(static_cast<float>(head_dim));
 }
 
-// Ensure tensor is contiguous int32 on CPU.
-inline torch::Tensor to_cpu_int32(const torch::Tensor& t) {
-    auto out = t.is_cpu() ? t : t.to(torch::kCPU);
-    if (out.dtype() != torch::kInt32) out = out.to(torch::kInt32);
-    if (!out.is_contiguous()) out = out.contiguous();
-    return out;
-}
-
 // Round up to the next power of 2 (for values >= 1).
 inline int64_t next_pow2(int64_t v) {
     int64_t p = 1;
@@ -48,9 +40,8 @@ inline int64_t next_pow2(int64_t v) {
     return p;
 }
 
-// Convert block_tables [batch, max_blocks] + context_lens [batch] (both CPU
-// int32) into FlashInfer's paged format: indptr, indices, last_page_len.
-// Returned tensors are on `device`.
+// Convert per-sequence block tables + context lengths into FlashInfer's paged
+// format: indptr, indices, last_page_len.  Returned tensors are on `device`.
 struct PagedMeta {
     torch::Tensor indptr;        // [batch_size + 1]
     torch::Tensor indices;       // [total_pages]
@@ -58,30 +49,27 @@ struct PagedMeta {
 };
 
 PagedMeta build_paged_meta(
-    const torch::Tensor& block_tables_cpu,
-    const torch::Tensor& context_lens_cpu,
+    const std::vector<std::vector<int32_t>>& block_tables,
+    const std::vector<int32_t>& context_lens,
     int32_t block_size,
     torch::Device device)
 {
-    int64_t batch_size = context_lens_cpu.size(0);
-    int64_t max_blocks = block_tables_cpu.size(1);
-    auto ctx_ptr = context_lens_cpu.data_ptr<int32_t>();
-    auto bt_ptr  = block_tables_cpu.data_ptr<int32_t>();
+    int64_t batch_size = static_cast<int64_t>(context_lens.size());
 
     std::vector<int32_t> indptr_vec(batch_size + 1);
     std::vector<int32_t> last_page_vec(batch_size);
     std::vector<int32_t> indices_vec;
-    indices_vec.reserve(batch_size * max_blocks);
 
     indptr_vec[0] = 0;
     for (int64_t i = 0; i < batch_size; ++i) {
-        int32_t ctx    = ctx_ptr[i];
+        int32_t ctx    = context_lens[i];
         int32_t npages = (ctx + block_size - 1) / block_size;
         indptr_vec[i + 1] = indptr_vec[i] + npages;
         int32_t rem = ctx % block_size;
         last_page_vec[i] = (rem == 0) ? block_size : rem;
+        const auto& table = block_tables[i];
         for (int32_t j = 0; j < npages; ++j)
-            indices_vec.push_back(bt_ptr[i * max_blocks + j]);
+            indices_vec.push_back(table[j]);
     }
 
     auto opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
@@ -218,8 +206,8 @@ torch::Tensor flash_attn_varlen(
 void flash_attn_decode_plan(
     const torch::Tensor& q_any,
     const torch::Tensor& k_cache,
-    const torch::Tensor& block_tables,
-    const torch::Tensor& context_lens,
+    const std::vector<std::vector<int32_t>>& block_tables,
+    const std::vector<int32_t>& context_lens,
     float softmax_scale,
     int64_t block_size)
 {
@@ -238,9 +226,8 @@ void flash_attn_decode_plan(
     pad.padded_num_heads = pad.padded_group * num_kv_heads;
     pad.needs_pad        = (pad.padded_num_heads != num_heads);
 
-    // Convert block_tables + context_lens → FlashInfer paged format.
     auto meta = build_paged_meta(
-        to_cpu_int32(block_tables), to_cpu_int32(context_lens),
+        block_tables, context_lens,
         static_cast<int32_t>(block_size), q_any.device());
 
     ensure_init();
@@ -302,8 +289,8 @@ torch::Tensor flash_attn_decode(
     const torch::Tensor& q,
     const torch::Tensor& k_cache,
     const torch::Tensor& v_cache,
-    const torch::Tensor& block_tables,
-    const torch::Tensor& context_lens,
+    const std::vector<std::vector<int32_t>>& block_tables,
+    const std::vector<int32_t>& context_lens,
     float softmax_scale,
     int64_t block_size)
 {
@@ -320,8 +307,8 @@ void flash_attn_prefill_paged_plan(
     const torch::Tensor& q_any,
     const torch::Tensor& k_cache,
     const torch::Tensor& cu_seqlens_q,
-    const torch::Tensor& block_tables,
-    const torch::Tensor& context_lens,
+    const std::vector<std::vector<int32_t>>& block_tables,
+    const std::vector<int32_t>& context_lens,
     float softmax_scale,
     int64_t block_size,
     bool causal)
@@ -331,9 +318,8 @@ void flash_attn_prefill_paged_plan(
     int64_t num_kv_heads = k_cache.size(2);
     softmax_scale = default_scale(head_dim, softmax_scale);
 
-    // Convert block_tables + context_lens → FlashInfer paged format.
     auto meta = build_paged_meta(
-        to_cpu_int32(block_tables), to_cpu_int32(context_lens),
+        block_tables, context_lens,
         static_cast<int32_t>(block_size), q_any.device());
 
     // Ensure cu_seqlens_q is on device.

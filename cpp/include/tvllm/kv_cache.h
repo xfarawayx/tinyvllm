@@ -73,7 +73,7 @@ class PagedKVCache {
   /// Returns a CUDA int32 tensor [batch_size] of flat slot indices.
   /// Also allocates any needed blocks and updates cur_len.
   torch::Tensor prepare_decode_slots(const std::vector<int64_t>& seq_ids,
-                                     const torch::Tensor& start_positions_cpu);
+                                     const std::vector<int64_t>& start_positions);
 
   /// Scatter K/V into paged cache using a pre-computed slot_mapping.
   /// Accepts any k/v rank whose last two dims are [num_kv_heads, head_dim]
@@ -85,12 +85,13 @@ class PagedKVCache {
 
   // ---- Metadata for kernel dispatch ----------------------------------------
 
-  /// Build CPU int32 block_tables metadata, shape [len(seq_ids), max_num_blocks].
-  /// Unused slots are filled with -1.
-  torch::Tensor block_tables_cpu_tensor(const std::vector<int64_t>& seq_ids) const;
+  /// Return per-sequence block tables (physical block ids).
+  std::vector<std::vector<int32_t>> block_tables(
+      const std::vector<int64_t>& seq_ids) const;
 
-  /// Build CPU int32 context_lens metadata, shape [len(seq_ids)].
-  torch::Tensor context_lens_cpu_tensor(const std::vector<int64_t>& seq_ids) const;
+  /// Return per-sequence context lengths (number of tokens stored).
+  std::vector<int32_t> context_lens(
+      const std::vector<int64_t>& seq_ids) const;
 
   // ---- Per-sequence query --------------------------------------------------
 

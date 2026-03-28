@@ -13,6 +13,9 @@
 //   2) flash_attn_decode  – paged KV‑cache decode            (cf. flash_attn_with_kvcache)
 // ---------------------------------------------------------------------------
 
+#include <cstdint>
+#include <vector>
+
 #include <torch/torch.h>
 
 namespace tvllm {
@@ -72,8 +75,8 @@ torch::Tensor flash_attn_varlen(
 void flash_attn_decode_plan(
     const torch::Tensor& q_any,       // only used for dtype/device inference
     const torch::Tensor& k_cache,     // [num_blocks, block_size, num_kv_heads, head_dim]
-    const torch::Tensor& block_tables, // [batch_size, max_num_blocks_per_seq] int32, preferably CPU
-    const torch::Tensor& context_lens, // [batch_size] int32, preferably CPU
+    const std::vector<std::vector<int32_t>>& block_tables, // per-sequence physical block ids
+    const std::vector<int32_t>& context_lens,              // per-sequence context length
     float softmax_scale = 0.0f,
     int64_t block_size = 16);
 
@@ -86,8 +89,8 @@ torch::Tensor flash_attn_decode(
     const torch::Tensor& q,
     const torch::Tensor& k_cache,
     const torch::Tensor& v_cache,
-    const torch::Tensor& block_tables,
-    const torch::Tensor& context_lens,
+    const std::vector<std::vector<int32_t>>& block_tables,
+    const std::vector<int32_t>& context_lens,
     float softmax_scale = 0.0f,
     int64_t block_size = 16);
 
@@ -109,8 +112,8 @@ void flash_attn_prefill_paged_plan(
     const torch::Tensor& q_any,       // only for dtype/device inference [total_q, num_heads, head_dim]
     const torch::Tensor& k_cache,     // [num_blocks, block_size, num_kv_heads, head_dim]
     const torch::Tensor& cu_seqlens_q, // [batch_size + 1] int32 — cumulative Q token counts
-    const torch::Tensor& block_tables, // [batch_size, max_num_blocks] int32
-    const torch::Tensor& context_lens, // [batch_size] int32 — total KV len per sequence
+    const std::vector<std::vector<int32_t>>& block_tables, // per-sequence physical block ids
+    const std::vector<int32_t>& context_lens,              // per-sequence total KV length
     float softmax_scale = 0.0f,
     int64_t block_size = 16,
     bool causal = true);

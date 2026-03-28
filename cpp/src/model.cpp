@@ -292,18 +292,16 @@ torch::Tensor QwenModel::forward_prefill(
       seq_ids, start_pos, seq_lens);
 
   // If using paged prefill, plan once before the layer loop.
-  // We need block_tables and context_lens from the cache.
-  torch::Tensor block_tables_t, context_lens_t;
+  std::vector<std::vector<int32_t>> paged_block_tables;
+  std::vector<int32_t> paged_context_lens;
   if (has_prefix_cache) {
     // Fetch block_tables after prepare_prefill_slots so newly allocated
     // blocks are included.
-    block_tables_t = cache.block_tables_cpu_tensor(seq_ids);
-    std::vector<int32_t> ctx_lens(nseq);
+    paged_block_tables = cache.block_tables(seq_ids);
+    paged_context_lens.resize(nseq);
     for (int64_t i = 0; i < nseq; ++i) {
-      ctx_lens[i] = static_cast<int32_t>(start_pos[i] + seq_lens[i]);
+      paged_context_lens[i] = static_cast<int32_t>(start_pos[i] + seq_lens[i]);
     }
-    context_lens_t = torch::tensor(ctx_lens,
-        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
   }
 
   int64_t q_dim = config_.num_attention_heads * head_dim_;
@@ -352,7 +350,7 @@ torch::Tensor QwenModel::forward_prefill(
         // Plan once, reuse across all layers.
         cuda::flash_attn_prefill_paged_plan(
             q, cache.k_pool(li), cu_seqlens,
-            block_tables_t, context_lens_t,
+            paged_block_tables, paged_context_lens,
             0.0f, cache.block_size(), /*causal=*/true);
       }
       context = cuda::flash_attn_prefill_paged_run(
@@ -403,7 +401,7 @@ torch::Tensor QwenModel::forward_decode(const torch::Tensor& input_ids,
                                         const torch::Tensor& positions,
                                         const std::vector<int64_t>& seq_ids,
                                         PagedKVCache& cache,
-                                        const torch::Tensor& positions_cpu) {
+                                        const std::vector<int64_t>& start_positions) {
   auto input = input_ids.to(device_).to(torch::kLong);
   auto pos = positions.is_cuda() ? positions.to(torch::kLong)
                                  : positions.to(device_).to(torch::kLong);
@@ -425,16 +423,10 @@ torch::Tensor QwenModel::forward_decode(const torch::Tensor& input_ids,
   int64_t kv_dim = config_.num_key_value_heads * head_dim_;
   bool use_fused = !config_.use_nf4;
 
-  torch::Tensor block_tables, context_lens;
+  std::vector<std::vector<int32_t>> block_tables;
+  std::vector<int32_t> context_lens;
 
-  // Use caller-provided CPU positions to avoid GPU->CPU sync.
-  auto start_pos_cpu = positions_cpu.defined()
-      ? positions_cpu.to(torch::kLong).contiguous()
-      : pos.squeeze(1).to(torch::kCPU);
-
-  // Pre-compute slot_mapping once: allocates blocks, updates cur_len, builds
-  // CUDA int32 [B] mapping. Reused across all 28 layers (same slots).
-  auto slot_mapping = cache.prepare_decode_slots(seq_ids, start_pos_cpu);
+  auto slot_mapping = cache.prepare_decode_slots(seq_ids, start_positions);
 
   for (int64_t i = 0; i < config_.num_hidden_layers; ++i) {
     auto& layer = layers_[i];
@@ -471,8 +463,8 @@ torch::Tensor QwenModel::forward_decode(const torch::Tensor& input_ids,
     cache.append_batch(i, k, v, slot_mapping);
 
     if (i == 0) {
-      block_tables = cache.block_tables_cpu_tensor(seq_ids);
-      context_lens = cache.context_lens_cpu_tensor(seq_ids);
+      block_tables = cache.block_tables(seq_ids);
+      context_lens = cache.context_lens(seq_ids);
 
       // Plan once: converts CPU metadata to FlashInfer decode state.
       cuda::flash_attn_decode_plan(

@@ -232,16 +232,15 @@ torch::Tensor PagedKVCache::prepare_prefill_slots(
 
 torch::Tensor PagedKVCache::prepare_decode_slots(
     const std::vector<int64_t>& seq_ids,
-    const torch::Tensor& start_positions_cpu) {
+    const std::vector<int64_t>& start_positions) {
   const int64_t bsz = static_cast<int64_t>(seq_ids.size());
-  auto start_acc = start_positions_cpu.accessor<int64_t, 2>();
 
   std::vector<int32_t> slot_mapping_vec;
   slot_mapping_vec.reserve(bsz);
 
   for (int64_t b = 0; b < bsz; ++b) {
     const int64_t seq_id = seq_ids[b];
-    const int64_t pos = start_acc[b][0];
+    const int64_t pos = start_positions[b];
     if (pos < 0 || pos + 1 > config_.max_position_embeddings) {
       throw std::runtime_error("position overflow in prepare_decode_slots (start_pos=" +
           std::to_string(pos) + ")");
@@ -276,42 +275,24 @@ void PagedKVCache::append_batch(int64_t layer,
 //  Metadata for kernel dispatch
 // ===========================================================================
 
-torch::Tensor PagedKVCache::block_tables_cpu_tensor(
+std::vector<std::vector<int32_t>> PagedKVCache::block_tables(
     const std::vector<int64_t>& seq_ids) const {
-  const int64_t bsz = static_cast<int64_t>(seq_ids.size());
-
-  // Determine the widest block table in the batch.
-  int64_t max_blocks = 0;
+  std::vector<std::vector<int32_t>> out;
+  out.reserve(seq_ids.size());
   for (auto sid : seq_ids) {
-    const auto& seq = get_seq(sid);
-    max_blocks = std::max(max_blocks,
-                          static_cast<int64_t>(seq.block_table.size()));
+    out.push_back(get_seq(sid).block_table);
   }
-
-  // Build on CPU with accessor; decode planning consumes host metadata.
-  auto out = torch::full({bsz, max_blocks}, /*fill=*/-1,
-      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
-  auto acc = out.accessor<int32_t, 2>();
-
-  for (int64_t b = 0; b < bsz; ++b) {
-    const auto& table = get_seq(seq_ids[b]).block_table;
-    for (int64_t i = 0; i < static_cast<int64_t>(table.size()); ++i) {
-      acc[b][i] = table[i];
-    }
-  }
-
   return out;
 }
 
-torch::Tensor PagedKVCache::context_lens_cpu_tensor(
+std::vector<int32_t> PagedKVCache::context_lens(
     const std::vector<int64_t>& seq_ids) const {
-  std::vector<int32_t> lens;
-  lens.reserve(seq_ids.size());
+  std::vector<int32_t> out;
+  out.reserve(seq_ids.size());
   for (auto sid : seq_ids) {
-    lens.push_back(static_cast<int32_t>(get_seq(sid).cur_len));
+    out.push_back(static_cast<int32_t>(get_seq(sid).cur_len));
   }
-  return torch::tensor(lens,
-      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+  return out;
 }
 
 // ===========================================================================

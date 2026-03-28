@@ -67,7 +67,7 @@ class QwenModel {
                                const torch::Tensor& positions,
                                const std::vector<int64_t>& seq_ids,
                                PagedKVCache& cache,
-                               const torch::Tensor& positions_cpu = {});
+                               const std::vector<int64_t>& start_positions);
 
   const ModelConfig& config() const { return config_; }
 
