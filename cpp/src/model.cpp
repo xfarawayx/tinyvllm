@@ -105,10 +105,10 @@ static torch::Tensor linear(const torch::Tensor& x, const LinearWeight& lw) {
   torch::Tensor y;
   if (lw.nf4.has_value()) {
     const auto& nf4 = *lw.nf4;
-    y = cuda::nf4_linear_tiled(x, nf4.packed_weights, nf4.absmax_q,
-                                nf4.absmax2, nf4.code2, nf4.offset,
-                                nf4.blocksize, nf4.s2_blocksize,
-                                nf4.num_rows, nf4.num_cols);
+    y = cuda::nf4_linear(x, nf4.packed_weights, nf4.absmax_q,
+                          nf4.absmax2, nf4.code2, nf4.offset,
+                          nf4.blocksize, nf4.s2_blocksize,
+                          nf4.num_rows, nf4.num_cols);
   } else {
     y = torch::matmul(x, lw.weight.t());
   }

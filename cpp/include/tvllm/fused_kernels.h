@@ -111,10 +111,11 @@ void scatter_kv(torch::Tensor& k_pool,
 // s2_blocksize   : secondary block size (must be power of 2)
 // num_rows       : output rows (M)
 // num_cols       : output cols (N)
+// out_dtype      : desired output dtype (fp16 or bf16)
 //
 // Returns
 // -------
-// output : [num_rows, num_cols]  (fp16 or bf16)
+// output : [num_rows, num_cols]  in out_dtype
 //
 torch::Tensor nf4_dequantize(
     const torch::Tensor& packed_weights,
@@ -125,18 +126,12 @@ torch::Tensor nf4_dequantize(
     int blocksize,
     int s2_blocksize,
     int64_t num_rows,
-    int64_t num_cols);
+    int64_t num_cols,
+    torch::Dtype out_dtype);
 
-// ---------- NF4 Tiled Linear (fused dequant + GEMM) --------------------------
+// ---------- NF4 Linear (dequant + GEMM) --------------------------------------
 //
-// Instead of dequantizing the entire [N, K] weight matrix and then doing one
-// large matmul, this function processes the weight in row tiles of size TILE_N.
-// Each tile is dequantized into a small buffer (fits in L2 cache) and
-// immediately multiplied with the input via cuBLAS, avoiding a full-size fp16
-// intermediate and roughly halving global memory traffic.
-//
-// Falls back to the original full-dequantize path when the environment
-// variable TVLLM_NF4_TILED is set to "0".
+// Dequantizes the full [N, K] NF4 weight matrix and multiplies with input.
 //
 // Parameters
 // ----------
@@ -155,7 +150,7 @@ torch::Tensor nf4_dequantize(
 // -------
 // output : [*, N]  same dtype as input
 //
-torch::Tensor nf4_linear_tiled(
+torch::Tensor nf4_linear(
     const torch::Tensor& input,
     const torch::Tensor& packed_weights,
     const torch::Tensor& absmax_q,
