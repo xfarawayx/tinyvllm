@@ -124,7 +124,6 @@ outputs = engine.generate(
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `TVLLM_BLOCK_SIZE` | `16` | KV 缓存块大小（每块的 token 数） |
-| `TVLLM_GPU_MEMORY_UTILIZATION` | `0.90` | 分配给 KV 缓存的空闲 GPU 显存比例 |
 | `TVLLM_PREFIX_CACHING` | `0` | 设为 `1` 启用前缀缓存 |
 
 ## 架构

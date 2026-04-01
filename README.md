@@ -124,7 +124,6 @@ outputs = engine.generate(
 | Variable | Default | Description |
 |---|---|---|
 | `TVLLM_BLOCK_SIZE` | `16` | KV cache block size (tokens per block) |
-| `TVLLM_GPU_MEMORY_UTILIZATION` | `0.90` | Fraction of free GPU memory allocated to KV cache |
 | `TVLLM_PREFIX_CACHING` | `0` | Set to `1` to enable prefix caching |
 
 ## Architecture

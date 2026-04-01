@@ -73,18 +73,6 @@ static bool resolve_prefix_caching() {
   return env && std::string(env) == "1";
 }
 
-static double resolve_gpu_memory_utilization() {
-  const char* env = std::getenv("TVLLM_GPU_MEMORY_UTILIZATION");
-  if (!env) {
-    return 0.98;
-  }
-  try {
-    double val = std::stod(env);
-    if (val > 0.0 && val <= 1.0) return val;
-  } catch (...) {}
-  return 0.98;
-}
-
 static int64_t resolve_max_num_batched_tokens() {
   const char* env = std::getenv("TVLLM_MAX_NUM_BATCHED_TOKENS");
   if (!env) {
@@ -113,8 +101,7 @@ static int64_t resolve_max_num_batched_tokens() {
 //   3. Run forward_prefill with max_num_batched_tokens dummy tokens.
 //   4. activation_overhead = peak - current  (peak above steady state).
 //   5. Destroy temp cache, release memory.
-//   6. num_kv_blocks = (total * utilization - used - activation_overhead)
-//                      / per_block_bytes.
+//   6. num_kv_blocks = (free - activation_overhead) / per_block_bytes.
 //
 // Activation is a hard constraint (OOM crash if exceeded).  KV cache is a
 // soft constraint (scheduler defers requests if blocks run out).  By
@@ -125,7 +112,6 @@ static int64_t resolve_max_num_batched_tokens() {
 void Engine::profile_memory() {
   block_size_ = resolve_block_size();
   max_num_batched_tokens_ = resolve_max_num_batched_tokens();
-  double utilization = resolve_gpu_memory_utilization();
 
   int64_t head_dim = config_.head_dim > 0
       ? config_.head_dim
@@ -152,6 +138,16 @@ void Engine::profile_memory() {
     c10::cuda::CUDACachingAllocator::emptyCache();
     c10::cuda::CUDACachingAllocator::resetPeakStats(dev_idx);
 
+    // Record baseline reserved memory.  After emptyCache the allocator
+    // holds no cached blocks, so reserved == allocated == only live
+    // tensors (model weights + temp KV cache).
+    int64_t reserved_baseline;
+    {
+      auto bs = c10::cuda::CUDACachingAllocator::getDeviceStats(dev_idx);
+      reserved_baseline =
+          aggregate_allocator_stat(bs.reserved_bytes).current;
+    }
+
     // Forward pass with dummy tokens.
     std::vector<std::vector<int64_t>> dummy_ids = {
         std::vector<int64_t>(max_num_batched_tokens_, 0)
@@ -162,13 +158,18 @@ void Engine::profile_memory() {
     model_->forward_prefill(dummy_ids, seq_ids, temp_cache, start_pos);
     cudaDeviceSynchronize();
 
-    // Read peak activation overhead.
+    // Use reserved_bytes (actual CUDA memory claimed by the caching
+    // allocator) instead of allocated_bytes (what callers requested).
+    // For NF4 models the allocation churn from repeated
+    // dequant-temp → free → matmul cycles causes the allocator to
+    // reserve significantly more CUDA memory than the peak
+    // outstanding allocation.  Using reserved_bytes captures this
+    // overhead and prevents over-allocating KV-cache blocks.
     auto stats =
         c10::cuda::CUDACachingAllocator::getDeviceStats(dev_idx);
-    const auto& allocated_bytes = aggregate_allocator_stat(stats.allocated_bytes);
-    int64_t peak = allocated_bytes.peak;
-    int64_t current = allocated_bytes.current;
-    activation_peak = peak - current;
+    int64_t reserved_peak =
+        aggregate_allocator_stat(stats.reserved_bytes).peak;
+    activation_peak = reserved_peak - reserved_baseline;
 
     temp_cache.remove_sequence(seq_id);
     // ~PagedKVCache frees the block pool tensors when this scope exits.
@@ -186,38 +187,26 @@ void Engine::profile_memory() {
         cudaGetErrorString(err));
   }
 
-  // nanovllm formula:
-  //   num_blocks = (total * util - used - activation_peak) / per_block_bytes
-  //
-  // - total * util     : overall GPU memory budget
-  // - used             : model weights + FlashInfer workspace + non-PyTorch allocations
-  // - activation_peak  : measured peak activation overhead (reserved for forward pass)
-  size_t used = total_bytes - free_bytes;
-  int64_t memory_budget =
-      static_cast<int64_t>(static_cast<double>(total_bytes) * utilization);
-
+  // All free GPU memory (after model weights, FlashInfer workspace, etc.)
+  // minus the profiled activation peak goes to KV cache.
   int64_t per_block_bytes = 2 * config_.num_hidden_layers * block_size_ *
                             config_.num_key_value_heads * head_dim * dtype_bytes;
 
-  int64_t available_for_kv = memory_budget
-                             - static_cast<int64_t>(used)
-                             - activation_peak;
+  int64_t available_for_kv = static_cast<int64_t>(free_bytes) - activation_peak;
   num_kv_blocks_ = available_for_kv / per_block_bytes;
   num_kv_blocks_ = std::max(num_kv_blocks_, int64_t{1});
 
   fprintf(stderr,
       "[profile_memory] max_num_batched_tokens=%ld\n"
-      "  GPU total=%.0f MiB, used=%.0f MiB (weights + runtime)\n"
+      "  GPU total=%.0f MiB, free=%.0f MiB\n"
       "  activation peak=%.0f MiB (profiled)\n"
-      "  kv_cache: %ld blocks (%.0f MiB), "
-      "gpu_memory_utilization=%.0f%%\n",
+      "  kv_cache: %ld blocks (%.0f MiB)\n",
       max_num_batched_tokens_,
       total_bytes / (1024.0 * 1024.0),
-      used / (1024.0 * 1024.0),
+      free_bytes / (1024.0 * 1024.0),
       activation_peak / (1024.0 * 1024.0),
       num_kv_blocks_,
-      (num_kv_blocks_ * per_block_bytes) / (1024.0 * 1024.0),
-      utilization * 100.0);
+      (num_kv_blocks_ * per_block_bytes) / (1024.0 * 1024.0));
 
   // Construct the persistent KV cache once.
   prefix_caching_ = resolve_prefix_caching();
