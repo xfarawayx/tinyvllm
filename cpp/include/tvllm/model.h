@@ -57,11 +57,15 @@ class QwenModel {
             torch::Device device,
             torch::Dtype dtype);
 
+  /// Prefill and return logits.
+  /// all_logits=false (default): last-token only [nseq, vocab].
+  /// all_logits=true: all tokens [total_tokens, vocab].
   torch::Tensor forward_prefill(
       const std::vector<std::vector<int64_t>>& input_ids_list,
       const std::vector<int64_t>& seq_ids,
       PagedKVCache& cache,
-      const std::vector<int64_t>& start_positions = {});
+      const std::vector<int64_t>& start_positions = {},
+      bool all_logits = false);
 
   torch::Tensor forward_decode(const torch::Tensor& input_ids,
                                const torch::Tensor& positions,

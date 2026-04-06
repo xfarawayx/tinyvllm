@@ -46,6 +46,8 @@ PYBIND11_MODULE(tinyvllm, m) {
            pybind11::arg("sample_params"),
            pybind11::arg("max_batch_size") = 0)
       .def("reset", &tvllm::Engine::reset)
+      .def("forward_logits", &tvllm::Engine::forward_logits,
+           pybind11::arg("batch_input_ids"))
       .def("eos_token_id", &tvllm::Engine::eos_token_id)
       .def("max_position_embeddings", &tvllm::Engine::max_position_embeddings);
 }

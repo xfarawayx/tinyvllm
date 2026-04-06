@@ -223,7 +223,8 @@ torch::Tensor QwenModel::forward_prefill(
     const std::vector<std::vector<int64_t>>& input_ids_list,
     const std::vector<int64_t>& seq_ids,
     PagedKVCache& cache,
-    const std::vector<int64_t>& start_positions) {
+    const std::vector<int64_t>& start_positions,
+    bool all_logits) {
   int64_t nseq = static_cast<int64_t>(input_ids_list.size());
   if (nseq != static_cast<int64_t>(seq_ids.size())) {
     throw std::runtime_error("input_ids_list and seq_ids size mismatch");
@@ -383,6 +384,13 @@ torch::Tensor QwenModel::forward_prefill(
 
   auto x_norm_final = cuda::rms_norm(x, norm_weight_, config_.rms_norm_eps);
 
+  if (all_logits) {
+    // Return logits for every token: [total_tokens, vocab_size].
+    return torch::matmul(x_norm_final, lm_head_weight_.t());
+  }
+
+  // Extract last token per sequence BEFORE the vocab projection to avoid
+  // materializing the huge [total_tokens, vocab] tensor.
   std::vector<int64_t> last_indices;
   last_indices.reserve(nseq);
   int64_t offset = 0;
@@ -393,8 +401,7 @@ torch::Tensor QwenModel::forward_prefill(
   auto indices = torch::tensor(last_indices,
       torch::TensorOptions().device(device_).dtype(torch::kLong));
   auto last_tokens = x_norm_final.index_select(0, indices);
-  auto logits = torch::matmul(last_tokens, lm_head_weight_.t());
-  return logits;
+  return torch::matmul(last_tokens, lm_head_weight_.t());  // [nseq, vocab_size]
 }
 
 torch::Tensor QwenModel::forward_decode(const torch::Tensor& input_ids,

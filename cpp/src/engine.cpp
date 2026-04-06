@@ -432,6 +432,40 @@ std::vector<std::vector<int64_t>> Engine::generate(
   return outputs;
 }
 
+torch::Tensor Engine::forward_logits(
+    const std::vector<std::vector<int64_t>>& batch_input_ids) {
+  torch::NoGradGuard no_grad;
+
+  if (batch_input_ids.empty()) {
+    throw std::runtime_error("batch_input_ids cannot be empty");
+  }
+  for (const auto& seq : batch_input_ids) {
+    if (seq.empty()) {
+      throw std::runtime_error("each sequence must be non-empty");
+    }
+  }
+
+  PagedKVCache& cache = *cache_;
+
+  // Allocate temporary sequences in the KV cache.
+  std::vector<int64_t> seq_ids;
+  seq_ids.reserve(batch_input_ids.size());
+  for (size_t i = 0; i < batch_input_ids.size(); ++i) {
+    seq_ids.push_back(cache.add_sequence());
+  }
+
+  std::vector<int64_t> start_pos(batch_input_ids.size(), 0);
+  auto logits = model_->forward_prefill(
+      batch_input_ids, seq_ids, cache, start_pos, /*all_logits=*/true);
+
+  // Clean up temporary sequences.
+  for (auto sid : seq_ids) {
+    cache.remove_sequence(sid);
+  }
+
+  return logits;
+}
+
 void Engine::reset() {
   if (cache_) {
     cache_->reset();

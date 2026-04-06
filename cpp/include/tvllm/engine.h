@@ -27,6 +27,10 @@ class Engine {
       const std::vector<SampleParams>& sample_params,
       int64_t max_batch_size);
 
+  /// Run prefill and return logits for all tokens [total_tokens, vocab].
+  torch::Tensor forward_logits(
+      const std::vector<std::vector<int64_t>>& batch_input_ids);
+
   void reset();
 
   int64_t eos_token_id() const { return config_.eos_token_id; }
