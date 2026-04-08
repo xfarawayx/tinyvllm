@@ -6,7 +6,7 @@
 
 - **Qwen2.5 & Qwen3 支持** — 包括 Qwen3 的可选逐头 QK-norm
 - **FlashInfer 注意力后端** — prefill 和 decode 均使用 FlashInfer，采用 plan/run 分离以减少 GPU→CPU 同步
-- **融合 CUDA 算子** — RMSNorm（fp32 累加）、RoPE（Q+K 原地计算）、SwiGLU 激活、decode KV scatter——每个算子将多个 libtorch 操作替换为单次 kernel 调用
+- **融合 CUDA 算子** — RMSNorm（fp32 累加）、融合 residual-add + RMSNorm、RoPE（Q+K 原地计算）、SwiGLU 激活、decode KV scatter——每个算子将多个 libtorch 操作替换为单次 kernel 调用
 - **分页 KV 缓存** — 固定大小的块池（默认 16 token/块），动态分配，通过 `cudaMemGetInfo` 自动计算 GPU 显存预算
 - **前缀缓存** — 基于内容哈希的块共享，链式哈希，LRU 淘汰
 - **NF4 量化** — 双重量化的 4-bit 权重，CUDA kernel 实时反量化（兼容 bitsandbytes）
@@ -117,6 +117,10 @@ outputs = engine.generate(
     max_batch_size=4,
 )
 # outputs: list[list[int]] — 每个序列生成的 token ID 列表
+
+# 前向传播返回 logits（用于困惑度评估）
+logits = engine.forward_logits(batch_input_ids=[[1, 2, 3]])
+# logits: torch.Tensor [total_tokens, vocab_size]
 ```
 
 ## 环境变量
@@ -138,7 +142,7 @@ Engine ─── Scheduler（FCFS 连续批处理）
 QwenModel ─── PagedKVCache ─── BlockManager（前缀缓存、LRU 淘汰）
   │
   ▼
-CUDA Kernels（RMSNorm、RoPE、SwiGLU、KV scatter、NF4 反量化、decode attention）
+CUDA Kernels（RMSNorm、融合 add+RMSNorm、RoPE、SwiGLU、KV scatter、NF4 反量化）
   │
   ▼
 FlashInfer（prefill & decode 注意力包装器）
@@ -150,13 +154,14 @@ FlashInfer（prefill & decode 注意力包装器）
 cpp/
   include/tvllm/     # 头文件（config、engine、model、attention、kv_cache 等）
   src/               # C++ 实现 + pybind11 绑定
-  src/kernels/       # CUDA 算子（rms_norm、rope、silu_mul、kv_cache、nf4_dequant、decode_v2）
+  src/kernels/       # CUDA 算子（rms_norm、rope、silu_mul、kv_cache、nf4_dequant）
 python/
   convert_qwen25.py      # HF → tinyvllm 权重转换（fp16/bf16/fp32）
   convert_qwen25_nf4.py  # HF → tinyvllm NF4 量化转换
   run_generate.py         # 推理 CLI
   chat.py                 # 交互式多轮对话
   benchmark.py            # 吞吐量测试
+  eval_perplexity.py      # WikiText-2 困惑度评估
 CMakeLists.txt
 make.sh                   # 构建便捷脚本
 ```

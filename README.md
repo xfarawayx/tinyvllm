@@ -6,7 +6,7 @@ A minimal LLM inference engine for Qwen2.5 / Qwen3 models, built from scratch in
 
 - **Qwen2.5 & Qwen3 support** — including optional per-head QK-norm for Qwen3
 - **FlashInfer-backed attention** — runtime prefill and decode use FlashInfer wrappers, with plan/run split to minimize GPU→CPU syncs
-- **Fused CUDA kernels** — RMSNorm (fp32 accumulation), RoPE (in-place on Q+K), SwiGLU activation, KV scatter for decode — each replacing multi-op libtorch calls with a single kernel launch
+- **Fused CUDA kernels** — RMSNorm (fp32 accumulation), fused residual-add + RMSNorm, RoPE (in-place on Q+K), SwiGLU activation, KV scatter for decode — each replacing multi-op libtorch calls with a single kernel launch
 - **Paged KV-cache** — fixed-size block pool (default 16 tokens/block), dynamic allocation, automatic GPU memory budgeting via `cudaMemGetInfo`
 - **Prefix caching** — content-addressable block sharing with chained hashing and LRU eviction
 - **NF4 quantization** — double-quantized 4-bit weights with on-the-fly CUDA dequantization (bitsandbytes-compatible)
@@ -117,6 +117,10 @@ outputs = engine.generate(
     max_batch_size=4,
 )
 # outputs: list[list[int]] — generated token IDs per sequence
+
+# Forward pass returning logits (for perplexity evaluation)
+logits = engine.forward_logits(batch_input_ids=[[1, 2, 3]])
+# logits: torch.Tensor [total_tokens, vocab_size]
 ```
 
 ## Environment variables
@@ -138,7 +142,7 @@ Engine ─── Scheduler (FCFS continuous batching)
 QwenModel ─── PagedKVCache ─── BlockManager (prefix caching, LRU eviction)
   │
   ▼
-CUDA Kernels (RMSNorm, RoPE, SwiGLU, KV scatter, NF4 dequant, decode attention)
+CUDA Kernels (RMSNorm, fused add+RMSNorm, RoPE, SwiGLU, KV scatter, NF4 dequant)
   │
   ▼
 FlashInfer (prefill & decode attention wrappers)
@@ -150,13 +154,14 @@ FlashInfer (prefill & decode attention wrappers)
 cpp/
   include/tvllm/     # Headers (config, engine, model, attention, kv_cache, etc.)
   src/               # C++ implementations + pybind11 bindings
-  src/kernels/       # CUDA kernels (rms_norm, rope, silu_mul, kv_cache, nf4_dequant, decode_v2)
+  src/kernels/       # CUDA kernels (rms_norm, rope, silu_mul, kv_cache, nf4_dequant)
 python/
   convert_qwen25.py      # HF → tinyvllm weight conversion (fp16/bf16/fp32)
   convert_qwen25_nf4.py  # HF → tinyvllm NF4 quantized conversion
   run_generate.py         # Inference CLI
   chat.py                 # Interactive multi-turn chat
   benchmark.py            # Throughput benchmark
+  eval_perplexity.py      # WikiText-2 perplexity evaluation
 CMakeLists.txt
 make.sh                   # Build convenience script
 ```
