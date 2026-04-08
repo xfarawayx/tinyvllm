@@ -101,5 +101,96 @@ torch::Tensor rms_norm(const torch::Tensor& x,
   return output.reshape(x.sizes());
 }
 
+// ============================================================================
+//  Fused residual-add + RMSNorm kernel
+// ============================================================================
+
+template <typename scalar_t>
+__global__ void fused_add_rms_norm_kernel(
+    scalar_t* __restrict__ residual,    // [num_rows, hidden_size]  in/out
+    const scalar_t* __restrict__ x,     // [num_rows, hidden_size]  addend
+    const scalar_t* __restrict__ weight, // [hidden_size]
+    scalar_t* __restrict__ output,      // [num_rows, hidden_size]  normed
+    int hidden_size,
+    float eps) {
+  const int row = blockIdx.x;
+  const int warpId = threadIdx.x / kWarpSize;
+  const int laneId = threadIdx.x % kWarpSize;
+
+  float sum_sq = 0.0f;
+  __shared__ float sum_sq_s[kWarpSize], rms_inv;
+
+  // Pass 1: residual += x, accumulate sum_sq
+  for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+    float r = static_cast<float>(residual[row * hidden_size + i]);
+    float a = static_cast<float>(x[row * hidden_size + i]);
+    float val = r + a;
+    residual[row * hidden_size + i] = static_cast<scalar_t>(val);
+    sum_sq += val * val;
+  }
+
+  // Warp-parallel reduction
+  for (int s = kWarpSize >> 1; s > 0; s >>= 1) {
+    sum_sq += __shfl_down_sync(0xffffffff, sum_sq, s);
+  }
+
+  if (laneId == 0) {
+    sum_sq_s[warpId] = sum_sq;
+  }
+  __syncthreads();
+
+  if (warpId == 0) {
+    sum_sq = (threadIdx.x < (blockDim.x / kWarpSize)) ? sum_sq_s[laneId] : 0.0f;
+    for (int s = kWarpSize >> 1; s > 0; s >>= 1) {
+      sum_sq += __shfl_down_sync(0xffffffff, sum_sq, s);
+    }
+    if (laneId == 0) {
+      rms_inv = rsqrtf(sum_sq / hidden_size + eps);
+    }
+  }
+
+  __syncthreads();
+
+  // Pass 2: normalize (read back updated residual)
+  for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+    float w = static_cast<float>(weight[i]);
+    float val = static_cast<float>(residual[row * hidden_size + i]);
+    output[row * hidden_size + i] = static_cast<scalar_t>(val * rms_inv * w);
+  }
+}
+
+torch::Tensor fused_add_rms_norm(torch::Tensor& residual,
+                                 const torch::Tensor& x,
+                                 const torch::Tensor& weight,
+                                 double eps) {
+  TORCH_CHECK(residual.is_cuda(), "fused_add_rms_norm: residual must be on CUDA");
+  TORCH_CHECK(x.is_cuda(), "fused_add_rms_norm: x must be on CUDA");
+  TORCH_CHECK(weight.is_cuda(), "fused_add_rms_norm: weight must be on CUDA");
+  TORCH_CHECK(residual.size(-1) == weight.size(0),
+              "fused_add_rms_norm: residual last dim != weight size");
+
+  auto res_flat = residual.reshape({-1, residual.size(-1)});
+  auto x_flat = x.reshape({-1, x.size(-1)});
+  int num_rows = res_flat.size(0);
+  int hidden_size = res_flat.size(1);
+  auto output = torch::empty_like(res_flat);
+
+  constexpr int block_size = 256;
+  dim3 grid(num_rows);
+  dim3 block(block_size);
+
+  TVLLM_DISPATCH_FLOAT16(residual.scalar_type(), "fused_add_rms_norm_kernel", [&] {
+    fused_add_rms_norm_kernel<scalar_t><<<grid, block>>>(
+        res_flat.data_ptr<scalar_t>(),
+        x_flat.data_ptr<scalar_t>(),
+        weight.data_ptr<scalar_t>(),
+        output.data_ptr<scalar_t>(),
+        hidden_size,
+        static_cast<float>(eps));
+  });
+
+  return output.reshape(x.sizes());
+}
+
 }  // namespace cuda
 }  // namespace tvllm

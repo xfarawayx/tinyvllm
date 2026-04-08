@@ -309,10 +309,11 @@ torch::Tensor QwenModel::forward_prefill(
   int64_t kv_dim = config_.num_key_value_heads * head_dim_;
   bool use_fused = !config_.use_nf4;
 
+  // First layer: standalone input_norm (no preceding residual add to fuse).
+  auto x_norm = cuda::rms_norm(x, layers_[0].input_norm, config_.rms_norm_eps);
+
   for (int64_t li = 0; li < config_.num_hidden_layers; ++li) {
     auto& layer = layers_[li];
-
-    auto x_norm = cuda::rms_norm(x, layer.input_norm, config_.rms_norm_eps);
 
     torch::Tensor q, k, v;
     if (use_fused) {
@@ -366,9 +367,10 @@ torch::Tensor QwenModel::forward_prefill(
 
     context = context.reshape({total_tokens, config_.num_attention_heads * head_dim_});
     auto attn_out = linear(context, layer.o_proj);
-    x = x + attn_out;
 
-    auto ffn_norm = cuda::rms_norm(x, layer.post_norm, config_.rms_norm_eps);
+    // Fused: x += attn_out; ffn_norm = rms_norm(x)
+    auto ffn_norm = cuda::fused_add_rms_norm(x, attn_out, layer.post_norm, config_.rms_norm_eps);
+
     torch::Tensor gate_up;
     if (use_fused) {
       gate_up = linear(ffn_norm, layer.gate_up_proj);
@@ -379,14 +381,20 @@ torch::Tensor QwenModel::forward_prefill(
     }
     auto ff = cuda::silu_mul(gate_up);
     auto mlp_out = linear(ff, layer.down_proj);
-    x = x + mlp_out;
+
+    // Fused: x += mlp_out; x_norm = rms_norm(x) for next layer (or final norm)
+    if (li + 1 < config_.num_hidden_layers) {
+      x_norm = cuda::fused_add_rms_norm(x, mlp_out, layers_[li + 1].input_norm, config_.rms_norm_eps);
+    } else {
+      x_norm = cuda::fused_add_rms_norm(x, mlp_out, norm_weight_, config_.rms_norm_eps);
+    }
   }
 
-  auto x_norm_final = cuda::rms_norm(x, norm_weight_, config_.rms_norm_eps);
+  // x_norm already contains rms_norm(x, norm_weight_) from the last fused op.
 
   if (all_logits) {
     // Return logits for every token: [total_tokens, vocab_size].
-    return torch::matmul(x_norm_final, lm_head_weight_.t());
+    return torch::matmul(x_norm, lm_head_weight_.t());
   }
 
   // Extract last token per sequence BEFORE the vocab projection to avoid
@@ -400,7 +408,7 @@ torch::Tensor QwenModel::forward_prefill(
   }
   auto indices = torch::tensor(last_indices,
       torch::TensorOptions().device(device_).dtype(torch::kLong));
-  auto last_tokens = x_norm_final.index_select(0, indices);
+  auto last_tokens = x_norm.index_select(0, indices);
   return torch::matmul(last_tokens, lm_head_weight_.t());  // [nseq, vocab_size]
 }
 
@@ -435,10 +443,11 @@ torch::Tensor QwenModel::forward_decode(const torch::Tensor& input_ids,
 
   auto slot_mapping = cache.prepare_decode_slots(seq_ids, start_positions);
 
+  // First layer: standalone input_norm (no preceding residual add to fuse).
+  auto x_norm = cuda::rms_norm(x, layers_[0].input_norm, config_.rms_norm_eps);
+
   for (int64_t i = 0; i < config_.num_hidden_layers; ++i) {
     auto& layer = layers_[i];
-
-    auto x_norm = cuda::rms_norm(x, layer.input_norm, config_.rms_norm_eps);
 
     torch::Tensor q, k, v;
     if (use_fused) {
@@ -488,9 +497,10 @@ torch::Tensor QwenModel::forward_decode(const torch::Tensor& input_ids,
 
     context = context.reshape({bsz, seq_len, config_.num_attention_heads * head_dim_});
     auto attn_out = linear(context, layer.o_proj);
-    x = x + attn_out;
 
-    auto ffn_norm = cuda::rms_norm(x, layer.post_norm, config_.rms_norm_eps);
+    // Fused: x += attn_out; ffn_norm = rms_norm(x)
+    auto ffn_norm = cuda::fused_add_rms_norm(x, attn_out, layer.post_norm, config_.rms_norm_eps);
+
     torch::Tensor gate_up;
     if (use_fused) {
       gate_up = linear(ffn_norm, layer.gate_up_proj);
@@ -501,10 +511,15 @@ torch::Tensor QwenModel::forward_decode(const torch::Tensor& input_ids,
     }
     auto ff = cuda::silu_mul(gate_up);
     auto mlp_out = linear(ff, layer.down_proj);
-    x = x + mlp_out;
+
+    // Fused: x += mlp_out; x_norm = rms_norm(x) for next layer (or final norm)
+    if (i + 1 < config_.num_hidden_layers) {
+      x_norm = cuda::fused_add_rms_norm(x, mlp_out, layers_[i + 1].input_norm, config_.rms_norm_eps);
+    } else {
+      x_norm = cuda::fused_add_rms_norm(x, mlp_out, norm_weight_, config_.rms_norm_eps);
+    }
   }
 
-  auto x_norm = cuda::rms_norm(x, norm_weight_, config_.rms_norm_eps);
   auto last = x_norm.index({Slice(), 0, Slice()});
   auto logits = torch::matmul(last, lm_head_weight_.t());
   return logits;

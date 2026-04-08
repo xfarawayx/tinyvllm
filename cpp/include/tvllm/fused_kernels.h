@@ -35,6 +35,28 @@ torch::Tensor rms_norm(const torch::Tensor& x,
                        const torch::Tensor& weight,
                        double eps);
 
+// ---------- Fused Residual-Add + RMSNorm ---------------------------------
+//
+// Computes in a single kernel:
+//   residual += x            (in-place update)
+//   output = rms_norm(residual, weight, eps)
+//
+// Parameters
+// ----------
+// residual : [*, hidden_size]  (fp16/bf16)  – updated in-place
+// x        : [*, hidden_size]  (fp16/bf16)  – addend
+// weight   : [hidden_size]     (fp16/bf16)  – RMSNorm scale
+// eps      : RMSNorm epsilon
+//
+// Returns
+// -------
+// output : [*, hidden_size]  same dtype as residual
+//
+torch::Tensor fused_add_rms_norm(torch::Tensor& residual,
+                                 const torch::Tensor& x,
+                                 const torch::Tensor& weight,
+                                 double eps);
+
 // ---------- Fused Rotary Position Embedding (RoPE) -----------------------
 //
 // Applies rotary embeddings to Q and K tensors **in-place**.
