@@ -85,7 +85,7 @@ def main() -> None:
     # --- Load model ---
     print("Loading model...", flush=True)
     load_start = time.perf_counter()
-    state_dict = torch.load(f"{args.model_dir}/state_dict.pt", map_location="cpu")
+    state_dict = torch.load(f"{args.model_dir}/state_dict.pt", map_location="cpu", weights_only=True)
     engine = tinyvllm.Engine(args.model_dir, state_dict)
     load_elapsed = time.perf_counter() - load_start
     print(f"Model loaded in {load_elapsed:.2f}s")
